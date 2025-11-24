@@ -1,119 +1,147 @@
 from flask import Flask, request, jsonify
-from tensorflow.keras.models import load_model
-from tensorflow.keras import backend as K
 import tensorflow as tf
 import numpy as np
 import cv2
+import os
 
 # ==========================================================
-# 🔹 Daftarkan fungsi custom agar model bisa diload
+# 🔹 Custom Layers (harus didefinisikan ulang!)
 # ==========================================================
-@tf.keras.utils.register_keras_serializable(package="Custom", name="euclidean_distance")
-def euclidean_distance(vects):
-    x, y = vects
-    sum_square = K.sum(K.square(x - y), axis=1, keepdims=True)
-    return K.sqrt(K.maximum(sum_square, K.epsilon()))
+@tf.keras.utils.register_keras_serializable(package="Custom", name="L2Normalize")
+class L2Normalize(tf.keras.layers.Layer):
+    def call(self, inputs):
+        return tf.math.l2_normalize(inputs, axis=1)
+
+@tf.keras.utils.register_keras_serializable(package="Custom", name="EuclideanDistance")
+class EuclideanDistance(tf.keras.layers.Layer):
+    def call(self, inputs):
+        x, y = inputs
+        return tf.sqrt(tf.maximum(tf.reduce_sum(tf.square(x - y), axis=1, keepdims=True), 1e-7))
 
 # ==========================================================
-# 🔹 Inisialisasi Flask app
+# 🔹 PATH MODEL + METRICS
+# ==========================================================
+EMBED_PATH = "embedding_model_clean.keras"
+METRIC_PATH = "metrics.npz"
+
+# ==========================================================
+# 🔹 Load embedding model (tanpa Lambda, aman)
+# ==========================================================
+print("🔹 Loading embedding model...")
+embedding_model = tf.keras.models.load_model(
+    EMBED_PATH,
+    compile=False
+)
+print("✅ Embedding model loaded!")
+
+# ==========================================================
+# 🔹 Load threshold dari metrics.npz
+# ==========================================================
+if os.path.exists(METRIC_PATH):
+    data = np.load(METRIC_PATH)
+    eer_threshold = float(data.get("eer_threshold", -0.85))
+    print(f"🔹 Loaded EER threshold: {eer_threshold}")
+else:
+    eer_threshold = -0.85
+    print("⚠️ metrics.npz not found, default eer_threshold = -0.85")
+
+# ==========================================================
+# 🔹 Flask init
 # ==========================================================
 app = Flask(__name__)
 
 # ==========================================================
-# 🔹 Load model Siamese
+# 🔹 Preprocessing (IDENTIK dengan training!)
 # ==========================================================
-MODEL_PATH = "signature_siamese_final.keras"  # ubah sesuai path kamu
+def preprocess_inference(file):
+    img = cv2.imdecode(np.frombuffer(file.read(), np.uint8), cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        raise ValueError("Image decode error")
 
-print("🔹 Loading Siamese model...")
-model = load_model(
-    MODEL_PATH,
-    compile=False,
-    custom_objects={"euclidean_distance": euclidean_distance}
-)
-print("✅ Model loaded successfully!")
+    # Step 1: blur
+    img = cv2.GaussianBlur(img, (3, 3), 0)
+
+    # Step 2: binarize
+    _, img_bin = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+    # Step 3: crop ke kontur terbesar
+    contours, _ = cv2.findContours(img_bin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if len(contours) > 0:
+        x, y, w, h = cv2.boundingRect(max(contours, key=cv2.contourArea))
+        sig = img_bin[y:y + h, x:x + w]
+    else:
+        sig = img_bin
+
+    target_h, target_w = 155,220
+    h0, w0 = sig.shape
+    scale = min((target_h - 10) / max(h0, 1), (target_w - 10) / max(w0, 1))
+
+    new_h = max(1, int(h0 * scale))
+    new_w = max(1, int(w0 * scale))
+    sig = cv2.resize(sig, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+    # Step 4: padding
+    pad_v = target_h - new_h
+    top = pad_v // 2
+    bottom = pad_v - top
+    left = (target_w - new_w) // 2
+    right = target_w - new_w - left
+
+    sig = np.pad(sig, ((top, bottom), (left, right)), mode='constant', constant_values=0)
+
+    sig = sig.astype("float32") / 255.0
+    sig = np.expand_dims(sig, axis=(0, -1))     # (1, 220, 155, 1)
+    return sig
 
 # ==========================================================
-# 🔹 Dapatkan encoder dari model Siamese
+# 🔹 Compare Endpoint (pakai distance -> similarity)
 # ==========================================================
-try:
-    encoder = model.layers[2]  # layer embedding (biasanya di posisi 2)
-    print("✅ Encoder layer extracted successfully!")
-except Exception as e:
-    print(f"⚠️ Gagal mengambil encoder: {e}")
-    encoder = None
+@app.route("/compare", methods=["POST"])
+def compare():
+    if "image1" not in request.files or "image2" not in request.files:
+        return jsonify({"error": "Upload image1 & image2"}), 400
 
-# ==========================================================
-# 🔹 Fungsi bantu: preprocessing gambar
-# ==========================================================
-def preprocess_image(image_file):
-    img = cv2.imdecode(np.frombuffer(image_file.read(), np.uint8), cv2.IMREAD_GRAYSCALE)
-    img = cv2.resize(img, (220, 155))  # sesuaikan ukuran input model
-    img = img.astype("float32") / 255.0
-    img = np.expand_dims(img, axis=(0, -1))
-    return img
+    img1 = preprocess_inference(request.files["image1"])
+    img2 = preprocess_inference(request.files["image2"])
 
-# ==========================================================
-# 🔹 Endpoint: langsung bandingkan dua gambar
-# ==========================================================
-@app.route('/compare', methods=['POST'])
-def compare_images():
-    if 'image1' not in request.files or 'image2' not in request.files:
-        return jsonify({"error": "Please upload both 'image1' and 'image2'"}), 400
+    emb1 = embedding_model.predict(img1)[0]
+    emb2 = embedding_model.predict(img2)[0]
 
-    threshold = float(request.form.get("threshold", 0.5))  # bisa dikirim opsional dari postman
+    # Euclidean distance (training model pakai ini)
+    distance = np.linalg.norm(emb1 - emb2)
 
-    img1 = preprocess_image(request.files['image1'])
-    img2 = preprocess_image(request.files['image2'])
+    # Convert to similarity (harus NEGATIVE distance)
+    similarity = -distance
 
-    if encoder is None:
-        return jsonify({"error": "Encoder not available"}), 500
+    # Decision using EER threshold
+    match = similarity >= eer_threshold
 
-    # 1️⃣ Ekstrak embedding dari kedua gambar
-    emb1 = encoder.predict(img1)[0]
-    emb2 = encoder.predict(img2)[0]
-
-    # 2️⃣ Hitung jarak Euclidean
-    distance = float(np.sqrt(np.sum(np.square(emb1 - emb2))))
-    match = distance < threshold
-
-    # 3️⃣ Return hasil + embedding (untuk debugging)
     return jsonify({
-        "distance": distance,
-        "threshold": threshold,
-        "match": bool(match),
-        "embedding1": emb1.tolist(),
-        "embedding2": emb2.tolist()
+        "distance": float(distance),
+        "similarity": float(similarity),
+        "threshold": float(eer_threshold),
+        "match": bool(match)
     })
 
-@app.route('/extract', methods=['POST'])
-def extract_embedding():
-    if 'image' not in request.files:
-        return jsonify({"error": "Please upload 'image'"}), 400
-
-    img = preprocess_image(request.files['image'])
-
-    if encoder is None:
-        return jsonify({"error": "Encoder not available"}), 500
-
-    emb = encoder.predict(img)[0]
-    return jsonify({
-        "embedding": emb.tolist()
-    })
-
-
 # ==========================================================
-# 🔹 Endpoint dasar
+# 🔹 Extract embedding
 # ==========================================================
-@app.route('/', methods=['GET'])
+@app.route("/extract", methods=["POST"])
+def extract():
+    if "image" not in request.files:
+        return jsonify({"error": "Upload image"}), 400
+
+    img = preprocess_inference(request.files["image"])
+    emb = embedding_model.predict(img)[0]
+
+    return jsonify({"embedding": emb.tolist()})
+
+@app.route("/")
 def home():
-    return jsonify({
-        "message": "✅ Siamese Compare API running.",
-        "endpoint": "/compare",
-        "usage": "POST form-data: image1, image2, (optional) threshold"
-    })
+    return jsonify({"message": "Signature Embedding API Running."})
 
 # ==========================================================
-# 🔹 Run server
+# 🔹 Run
 # ==========================================================
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=True)
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, debug=True)
