@@ -39,11 +39,11 @@ print("✅ Embedding model loaded!")
 # ==========================================================
 if os.path.exists(METRIC_PATH):
     data = np.load(METRIC_PATH)
-    eer_threshold = float(data.get("eer_threshold", -0.85))
+    eer_threshold = float(data.get("eer_threshold", -0.5250))
     print(f"🔹 Loaded EER threshold: {eer_threshold}")
 else:
-    eer_threshold = -0.85
-    print("⚠️ metrics.npz not found, default eer_threshold = -0.85")
+    eer_threshold = -0.5250
+    print("⚠️ metrics.npz not found, default eer_threshold = -0.52")
 
 # ==========================================================
 # 🔹 Flask init
