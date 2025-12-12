@@ -42,7 +42,7 @@ if os.path.exists(METRIC_PATH):
     eer_threshold = float(data.get("eer_threshold", -0.5250))
     print(f"🔹 Loaded EER threshold: {eer_threshold}")
 else:
-    eer_threshold = -0.5250
+    eer_threshold = -0.5868
     print("⚠️ metrics.npz not found, default eer_threshold = -0.52")
 
 # ==========================================================
