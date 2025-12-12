@@ -51,20 +51,20 @@ else:
 app = Flask(__name__)
 
 # ==========================================================
-# 🔹 Preprocessing (IDENTIK dengan training!)
+# 🔹 Preprocessing (HARUS identik dengan training MobileNet)
 # ==========================================================
 def preprocess_inference(file):
     img = cv2.imdecode(np.frombuffer(file.read(), np.uint8), cv2.IMREAD_GRAYSCALE)
     if img is None:
         raise ValueError("Image decode error")
 
-    # Step 1: blur
+    # Step 1: blur (sama seperti training)
     img = cv2.GaussianBlur(img, (3, 3), 0)
 
-    # Step 2: binarize
+    # Step 2: binarize (sama seperti training)
     _, img_bin = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
 
-    # Step 3: crop ke kontur terbesar
+    # Step 3: crop kontur terbesar
     contours, _ = cv2.findContours(img_bin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if len(contours) > 0:
         x, y, w, h = cv2.boundingRect(max(contours, key=cv2.contourArea))
@@ -72,25 +72,33 @@ def preprocess_inference(file):
     else:
         sig = img_bin
 
-    target_h, target_w = 155,220
+    # Step 4: resize + padding (identik training)
+    target_h, target_w = 155, 220
     h0, w0 = sig.shape
     scale = min((target_h - 10) / max(h0, 1), (target_w - 10) / max(w0, 1))
-
     new_h = max(1, int(h0 * scale))
     new_w = max(1, int(w0 * scale))
     sig = cv2.resize(sig, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
-    # Step 4: padding
     pad_v = target_h - new_h
     top = pad_v // 2
     bottom = pad_v - top
     left = (target_w - new_w) // 2
     right = target_w - new_w - left
-
     sig = np.pad(sig, ((top, bottom), (left, right)), mode='constant', constant_values=0)
 
+    # Step 5: Normalize
     sig = sig.astype("float32") / 255.0
-    sig = np.expand_dims(sig, axis=(0, -1))     # (1, 220, 155, 1)
+
+    # ================================
+    #   VERY IMPORTANT FOR MobileNet
+    # ================================
+    # Convert grayscale → 3-channel
+    sig = np.stack([sig, sig, sig], axis=-1)   # (H, W, 3)
+
+    # Expand dims → (1, H, W, 3)
+    sig = np.expand_dims(sig, 0)
+
     return sig
 
 # ==========================================================
