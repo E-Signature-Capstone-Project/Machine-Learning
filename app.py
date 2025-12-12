@@ -3,6 +3,7 @@ import tensorflow as tf
 import numpy as np
 import cv2
 import os
+from tensorflow.keras.applications.mobilenet_v2 import preprocess_input
 
 # ==========================================================
 # 🔹 Custom Layers (harus didefinisikan ulang!)
@@ -21,29 +22,32 @@ class EuclideanDistance(tf.keras.layers.Layer):
 # ==========================================================
 # 🔹 PATH MODEL + METRICS
 # ==========================================================
-EMBED_PATH = "embedding_model_clean.keras"
-METRIC_PATH = "metrics.npz"
+EMBED_PATH = "embedding_model_clean.keras"     # ganti sesuai lokasi
+METRIC_PATH = "metrics.npz"                    # ganti sesuai lokasi
+
+tf.keras.config.enable_unsafe_deserialization()
 
 # ==========================================================
-# 🔹 Load embedding model (tanpa Lambda, aman)
+# 🔹 Load embedding model (No Lambda)
 # ==========================================================
 print("🔹 Loading embedding model...")
 embedding_model = tf.keras.models.load_model(
     EMBED_PATH,
-    compile=False
+    compile=False,
+    safe_mode=False
 )
 print("✅ Embedding model loaded!")
 
 # ==========================================================
-# 🔹 Load threshold dari metrics.npz
+# 🔹 Load threshold metrics
 # ==========================================================
 if os.path.exists(METRIC_PATH):
     data = np.load(METRIC_PATH)
-    eer_threshold = float(data.get("eer_threshold", -0.5250))
+    eer_threshold = float(data.get("eer_threshold"))
     print(f"🔹 Loaded EER threshold: {eer_threshold}")
 else:
-    eer_threshold = -0.5868
-    print("⚠️ metrics.npz not found, default eer_threshold = -0.52")
+    eer_threshold = -0.5237
+    print("⚠️ metrics.npz not found — using default eer_threshold =", eer_threshold)
 
 # ==========================================================
 # 🔹 Flask init
@@ -51,58 +55,29 @@ else:
 app = Flask(__name__)
 
 # ==========================================================
-# 🔹 Preprocessing (HARUS identik dengan training MobileNet)
+# 🔹 Preprocessing (IDENTIK training MobileNetV2)
 # ==========================================================
 def preprocess_inference(file):
     img = cv2.imdecode(np.frombuffer(file.read(), np.uint8), cv2.IMREAD_GRAYSCALE)
     if img is None:
         raise ValueError("Image decode error")
 
-    # Step 1: blur (sama seperti training)
-    img = cv2.GaussianBlur(img, (3, 3), 0)
+    # --- Step 1: resize (training resize) ---
+    img = cv2.resize(img, (220, 155))
 
-    # Step 2: binarize (sama seperti training)
-    _, img_bin = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    # --- Step 2: convert grayscale → RGB ---
+    img_rgb = np.stack([img, img, img], axis=-1).astype("float32")
 
-    # Step 3: crop kontur terbesar
-    contours, _ = cv2.findContours(img_bin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if len(contours) > 0:
-        x, y, w, h = cv2.boundingRect(max(contours, key=cv2.contourArea))
-        sig = img_bin[y:y + h, x:x + w]
-    else:
-        sig = img_bin
-
-    # Step 4: resize + padding (identik training)
-    target_h, target_w = 155, 220
-    h0, w0 = sig.shape
-    scale = min((target_h - 10) / max(h0, 1), (target_w - 10) / max(w0, 1))
-    new_h = max(1, int(h0 * scale))
-    new_w = max(1, int(w0 * scale))
-    sig = cv2.resize(sig, (new_w, new_h), interpolation=cv2.INTER_AREA)
-
-    pad_v = target_h - new_h
-    top = pad_v // 2
-    bottom = pad_v - top
-    left = (target_w - new_w) // 2
-    right = target_w - new_w - left
-    sig = np.pad(sig, ((top, bottom), (left, right)), mode='constant', constant_values=0)
-
-    # Step 5: Normalize
-    sig = sig.astype("float32") / 255.0
-
-    # ================================
-    #   VERY IMPORTANT FOR MobileNet
-    # ================================
-    # Convert grayscale → 3-channel
-    sig = np.stack([sig, sig, sig], axis=-1)   # (H, W, 3)
+    # --- Step 3: MobileNet preprocess_input ---
+    img_rgb = preprocess_input(img_rgb)
 
     # Expand dims → (1, H, W, 3)
-    sig = np.expand_dims(sig, 0)
+    img_rgb = np.expand_dims(img_rgb, axis=0)
 
-    return sig
+    return img_rgb
 
 # ==========================================================
-# 🔹 Compare Endpoint (pakai distance -> similarity)
+# 🔹 Compare Endpoint
 # ==========================================================
 @app.route("/compare", methods=["POST"])
 def compare():
@@ -112,16 +87,12 @@ def compare():
     img1 = preprocess_inference(request.files["image1"])
     img2 = preprocess_inference(request.files["image2"])
 
-    emb1 = embedding_model.predict(img1)[0]
-    emb2 = embedding_model.predict(img2)[0]
+    emb1 = embedding_model.predict(img1, verbose=0)[0]
+    emb2 = embedding_model.predict(img2, verbose=0)[0]
 
-    # Euclidean distance (training model pakai ini)
     distance = np.linalg.norm(emb1 - emb2)
-
-    # Convert to similarity (harus NEGATIVE distance)
     similarity = -distance
 
-    # Decision using EER threshold
     match = similarity >= eer_threshold
 
     return jsonify({
@@ -140,13 +111,17 @@ def extract():
         return jsonify({"error": "Upload image"}), 400
 
     img = preprocess_inference(request.files["image"])
-    emb = embedding_model.predict(img)[0]
+    emb = embedding_model.predict(img, verbose=0)[0]
 
     return jsonify({"embedding": emb.tolist()})
 
+# ==========================================================
+# 🔹 Root
+# ==========================================================
 @app.route("/")
 def home():
-    return jsonify({"message": "Signature Embedding API Running."})
+    return jsonify({"message": "Signature Embedding API Running (MobileNetV2)."})
+
 
 # ==========================================================
 # 🔹 Run
