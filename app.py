@@ -6,7 +6,7 @@ import os
 from tensorflow.keras.applications.mobilenet_v2 import preprocess_input
 
 # ==========================================================
-# 🔹 Custom Layers (harus didefinisikan ulang!)
+# 🔹 Custom Layers (WAJIB sama dengan training)
 # ==========================================================
 @tf.keras.utils.register_keras_serializable(package="Custom", name="L2Normalize")
 class L2Normalize(tf.keras.layers.Layer):
@@ -17,37 +17,43 @@ class L2Normalize(tf.keras.layers.Layer):
 class EuclideanDistance(tf.keras.layers.Layer):
     def call(self, inputs):
         x, y = inputs
-        return tf.sqrt(tf.maximum(tf.reduce_sum(tf.square(x - y), axis=1, keepdims=True), 1e-7))
+        return tf.sqrt(
+            tf.maximum(tf.reduce_sum(tf.square(x - y), axis=1, keepdims=True), 1e-7)
+        )
 
 # ==========================================================
-# 🔹 PATH MODEL + METRICS
+# 🔹 CONFIG
 # ==========================================================
-EMBED_PATH = "embedding_model_clean.keras"     # ganti sesuai lokasi
-METRIC_PATH = "metrics.npz"                    # ganti sesuai lokasi
+IMG_H, IMG_W = 155, 220
 
-tf.keras.config.enable_unsafe_deserialization()
+EMBED_PATH  = "embedding_model_clean.keras"
+METRIC_PATH = "metrics.npz"
+
+STRICT_MARGIN = 0.15   # 🔥 penting → bikin sistem tidak permisif
 
 # ==========================================================
-# 🔹 Load embedding model (No Lambda)
+# 🔹 Load Embedding Model
 # ==========================================================
 print("🔹 Loading embedding model...")
 embedding_model = tf.keras.models.load_model(
     EMBED_PATH,
-    compile=False,
-    safe_mode=False
+    compile=False
 )
-print("✅ Embedding model loaded!")
+print("✅ Embedding model loaded")
 
 # ==========================================================
-# 🔹 Load threshold metrics
+# 🔹 Load Metrics & Threshold
 # ==========================================================
 if os.path.exists(METRIC_PATH):
     data = np.load(METRIC_PATH)
-    eer_threshold = float(data.get("eer_threshold"))
-    print(f"🔹 Loaded EER threshold: {eer_threshold}")
+    eer_threshold = float(data["eer_threshold"])
 else:
-    eer_threshold = -0.5237
-    print("⚠️ metrics.npz not found — using default eer_threshold =", eer_threshold)
+    eer_threshold = -0.55  # fallback aman
+
+STRICT_THRESHOLD = eer_threshold - STRICT_MARGIN
+
+print("🔹 EER threshold     :", eer_threshold)
+print("🔹 STRICT threshold  :", STRICT_THRESHOLD)
 
 # ==========================================================
 # 🔹 Flask init
@@ -55,62 +61,115 @@ else:
 app = Flask(__name__)
 
 # ==========================================================
-# 🔹 Preprocessing (IDENTIK training MobileNetV2)
+# 🔹 PREPROCESS — IDENTIK DENGAN TRAINING
 # ==========================================================
-def preprocess_inference(file):
-    img = cv2.imdecode(np.frombuffer(file.read(), np.uint8), cv2.IMREAD_GRAYSCALE)
+def preprocess_signature_file(file):
+    img = cv2.imdecode(np.frombuffer(file.read(), np.uint8), cv2.IMREAD_UNCHANGED)
     if img is None:
-        raise ValueError("Image decode error")
+        raise ValueError("Cannot decode image")
 
-    # --- Step 1: resize (training resize) ---
-    img = cv2.resize(img, (220, 155))
+    # ==============================
+    # 1. Handle channel
+    # ==============================
+    if len(img.shape) == 2:
+        gray = img
 
-    # --- Step 2: convert grayscale → RGB ---
-    img_rgb = np.stack([img, img, img], axis=-1).astype("float32")
+    elif img.shape[2] == 4:
+        rgb = img[:, :, :3].astype(np.float32)
+        alpha = img[:, :, 3].astype(np.float32) / 255.0
+        white = np.ones_like(rgb) * 255
+        blended = rgb * alpha[..., None] + white * (1 - alpha[..., None])
+        blended = blended.astype(np.uint8)
+        gray = cv2.cvtColor(blended, cv2.COLOR_BGR2GRAY)
 
-    # --- Step 3: MobileNet preprocess_input ---
-    img_rgb = preprocess_input(img_rgb)
+    else:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-    # Expand dims → (1, H, W, 3)
-    img_rgb = np.expand_dims(img_rgb, axis=0)
+    # ==============================
+    # 2. Denoise
+    # ==============================
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
 
-    return img_rgb
+    # ==============================
+    # 3. Binarize
+    # ==============================
+    _, bw = cv2.threshold(
+        gray, 0, 255,
+        cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
+    )
+
+    # ==============================
+    # 4. Extract signature
+    # ==============================
+    cnts, _ = cv2.findContours(
+        bw, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+    if not cnts:
+        raise ValueError("No signature found")
+
+    x, y, w, h = cv2.boundingRect(max(cnts, key=cv2.contourArea))
+    sig = bw[y:y+h, x:x+w]
+
+    # ==============================
+    # 5. Resize + Center Pad
+    # ==============================
+    scale = min(
+        (IMG_H - 10) / max(h, 1),
+        (IMG_W - 10) / max(w, 1)
+    )
+    new_h, new_w = int(h * scale), int(w * scale)
+    sig = cv2.resize(sig, (new_w, new_h))
+
+    canvas = np.zeros((IMG_H, IMG_W), dtype=np.uint8)
+    top  = (IMG_H - new_h) // 2
+    left = (IMG_W - new_w) // 2
+    canvas[top:top+new_h, left:left+new_w] = sig
+
+    # ==============================
+    # 6. Normalize + MobileNet
+    # ==============================
+    canvas = canvas.astype("float32") / 255.0
+    canvas = np.stack([canvas, canvas, canvas], axis=-1)
+    canvas = preprocess_input(canvas * 255.0)
+
+    return np.expand_dims(canvas, axis=0)
 
 # ==========================================================
-# 🔹 Compare Endpoint
+# 🔹 Compare Endpoint (STRICT)
 # ==========================================================
 @app.route("/compare", methods=["POST"])
 def compare():
     if "image1" not in request.files or "image2" not in request.files:
-        return jsonify({"error": "Upload image1 & image2"}), 400
+        return jsonify({"error": "image1 and image2 required"}), 400
 
-    img1 = preprocess_inference(request.files["image1"])
-    img2 = preprocess_inference(request.files["image2"])
+    img1 = preprocess_signature_file(request.files["image1"])
+    img2 = preprocess_signature_file(request.files["image2"])
 
     emb1 = embedding_model.predict(img1, verbose=0)[0]
     emb2 = embedding_model.predict(img2, verbose=0)[0]
 
-    distance = np.linalg.norm(emb1 - emb2)
+    distance = float(np.linalg.norm(emb1 - emb2))
     similarity = -distance
 
-    match = similarity >= eer_threshold
+    match = similarity >= STRICT_THRESHOLD
 
     return jsonify({
-        "distance": float(distance),
-        "similarity": float(similarity),
-        "threshold": float(eer_threshold),
+        "distance": distance,
+        "similarity": similarity,
+        "eer_threshold": eer_threshold,
+        "strict_threshold": STRICT_THRESHOLD,
         "match": bool(match)
     })
 
 # ==========================================================
-# 🔹 Extract embedding
+# 🔹 Extract Embedding
 # ==========================================================
 @app.route("/extract", methods=["POST"])
 def extract():
     if "image" not in request.files:
-        return jsonify({"error": "Upload image"}), 400
+        return jsonify({"error": "image required"}), 400
 
-    img = preprocess_inference(request.files["image"])
+    img = preprocess_signature_file(request.files["image"])
     emb = embedding_model.predict(img, verbose=0)[0]
 
     return jsonify({"embedding": emb.tolist()})
@@ -120,8 +179,11 @@ def extract():
 # ==========================================================
 @app.route("/")
 def home():
-    return jsonify({"message": "Signature Embedding API Running (MobileNetV2)."})
-
+    return jsonify({
+        "message": "Signature Verification API (STRICT MODE)",
+        "eer_threshold": eer_threshold,
+        "strict_threshold": STRICT_THRESHOLD
+    })
 
 # ==========================================================
 # 🔹 Run
